@@ -1,6 +1,7 @@
 # NvControl
 
 Utility for controlling NVIDIA GPU RGB lighting and fan speed via NVAPI.
+Tested on Palit Dual RTX 4060.
 
 ## Features
 
