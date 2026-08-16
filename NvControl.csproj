@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net472</TargetFramework>
+    <PlatformTarget>x64</PlatformTarget>
+    <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
+    <AssemblyTitle>NvControl</AssemblyTitle>
+    <AssemblyVersion>0.0.2</AssemblyVersion>
+    <AssemblyFileVersion>0.0.2</AssemblyFileVersion>
+    <Company>FreeGen</Company>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="NvAPIWrapper">
+      <HintPath>$(OutDir)NvAPIWrapper.dll</HintPath>
+      <Private>True</Private>
+    </Reference>
+
+    <PackageReference Include="Costura.Fody" Version="5.7.0" PrivateAssets="all" />
+    <PackageReference Include="Fody" Version="6.8.0" PrivateAssets="all" />
+  </ItemGroup>
+</Project>
