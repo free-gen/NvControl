@@ -4,10 +4,12 @@
     <TargetFramework>net472</TargetFramework>
     <PlatformTarget>x64</PlatformTarget>
     <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
+    <ApplicationIcon>app.ico</ApplicationIcon>
     <AssemblyTitle>NvControl</AssemblyTitle>
-    <AssemblyVersion>0.0.2</AssemblyVersion>
-    <AssemblyFileVersion>0.0.2</AssemblyFileVersion>
+    <AssemblyVersion>0.0.3</AssemblyVersion>
+    <AssemblyFileVersion>0.0.3</AssemblyFileVersion>
     <Company>FreeGen</Company>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
   </PropertyGroup>
 
   <ItemGroup>

@@ -136,7 +136,7 @@ namespace NvControl
                 {
                     Console.Clear();
                     Console.WriteLine(new string('-', 40));
-                    Console.WriteLine($"NvControl v0.0.2 by FreeGen");
+                    Console.WriteLine($"NvControl v0.0.3 by FreeGen");
                     Console.WriteLine(new string('-', 40));
                     Console.WriteLine($"Requires Administrator privileges to control fan speed.");
                     Console.WriteLine($"For silent mode, use -s or --silent");
