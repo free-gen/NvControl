@@ -233,6 +233,32 @@ namespace NvControl
             _lastSentBrightness = brightness;
         }
 
+        public void TurnOff()
+        {
+            if (!_initialized)
+                return;
+
+            SendColorCore(0, 0, 0, 0);
+
+            _currentR = 0;
+            _currentG = 0;
+            _currentB = 0;
+            _currentBrightness = 0;
+
+            _targetR = 0;
+            _targetG = 0;
+            _targetB = 0;
+            _targetBrightness = 0;
+
+            _lastSentR = 0;
+            _lastSentG = 0;
+            _lastSentB = 0;
+            _lastSentBrightness = 0;
+
+            _currentValid = true;
+            _targetValid = true;
+        }
+
         public void UpdateTemperature(int temperature)
         {
             if (!_initialized || _config.Mode != LightingMode.Status)

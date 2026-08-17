@@ -25,6 +25,7 @@ namespace NvControl
         private static LedControl _lighting;
         private static FanControl _fan;
         private static Mutex _singleInstanceMutex;
+        private static EventWaitHandle _shutdownEvent;
         private static ConsoleCtrlHandler _consoleHandler;
 
         private static readonly object LogLock = new object();
@@ -109,6 +110,7 @@ namespace NvControl
             }
             finally
             {
+                SafeTurnOffLed();
                 SafeRestoreFan();
 
                 try
@@ -144,6 +146,12 @@ namespace NvControl
                     }
                 }
 
+                if (_shutdownEvent != null)
+                {
+                    _shutdownEvent.Dispose();
+                    _shutdownEvent = null;
+                }
+
                 if (_singleInstanceMutex != null)
                 {
                     _singleInstanceMutex.Dispose();
@@ -156,7 +164,127 @@ namespace NvControl
         {
             bool createdNew;
             _singleInstanceMutex = new Mutex(true, "FreeGen.NvControl.SingleInstance", out createdNew);
-            return createdNew;
+
+            if (createdNew)
+            {
+                CreateShutdownEvent();
+                return true;
+            }
+
+            SignalPreviousInstanceToExit();
+
+            try
+            {
+                if (_singleInstanceMutex.WaitOne(3000))
+                {
+                    CreateShutdownEvent();
+                    return true;
+                }
+            }
+            catch (AbandonedMutexException)
+            {
+                CreateShutdownEvent();
+                return true;
+            }
+
+            KillPreviousInstance();
+
+            try
+            {
+                if (_singleInstanceMutex.WaitOne(2000))
+                {
+                    CreateShutdownEvent();
+                    return true;
+                }
+            }
+            catch (AbandonedMutexException)
+            {
+                CreateShutdownEvent();
+                return true;
+            }
+
+            return false;
+        }
+
+        private static void CreateShutdownEvent()
+        {
+            _shutdownEvent = new EventWaitHandle(
+                false,
+                EventResetMode.ManualReset,
+                "FreeGen.NvControl.Shutdown");
+
+            _shutdownEvent.Reset();
+            StartShutdownWatcher();
+        }
+
+        private static void StartShutdownWatcher()
+        {
+            Thread thread = new Thread(new ThreadStart(delegate
+            {
+                try
+                {
+                    _shutdownEvent.WaitOne();
+
+                    _running = false;
+
+                    // Give the main loop time to leave any current NVAPI call.
+                    Thread.Sleep(100);
+
+                    SafeTurnOffLed();
+                    SafeRestoreFan();
+
+                    Environment.Exit(0);
+                }
+                catch
+                {
+                }
+            }));
+
+            thread.IsBackground = true;
+            thread.Start();
+        }
+
+        private static void SignalPreviousInstanceToExit()
+        {
+            try
+            {
+                using (EventWaitHandle shutdownEvent =
+                    EventWaitHandle.OpenExisting("FreeGen.NvControl.Shutdown"))
+                {
+                    shutdownEvent.Set();
+                }
+            }
+            catch (WaitHandleCannotBeOpenedException)
+            {
+                // Older NvControl build without the shutdown event.
+                // KillPreviousInstance() will handle it after the timeout.
+            }
+        }
+
+        private static void KillPreviousInstance()
+        {
+            Process current = Process.GetCurrentProcess();
+            string currentPath = current.MainModule.FileName;
+
+            foreach (Process process in Process.GetProcessesByName(current.ProcessName))
+            {
+                if (process.Id == current.Id)
+                    continue;
+
+                try
+                {
+                    string processPath = process.MainModule.FileName;
+
+                    if (!string.Equals(processPath, currentPath, StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    process.Kill();
+                    process.WaitForExit(2000);
+                }
+                catch
+                {
+                }
+            }
         }
 
         private static void LoadConfiguration(string path)
@@ -384,6 +512,7 @@ namespace NvControl
 
             AppDomain.CurrentDomain.ProcessExit += delegate
             {
+                SafeTurnOffLed();
                 SafeRestoreFan();
             };
 
@@ -400,6 +529,7 @@ namespace NvControl
             if (ctrlType == 0 || ctrlType == 1 || ctrlType == 2 || ctrlType == 5 || ctrlType == 6)
             {
                 _running = false;
+                SafeTurnOffLed();
                 SafeRestoreFan();
             }
 
@@ -420,6 +550,23 @@ namespace NvControl
             catch (Exception ex)
             {
                 Log("FAN", "Unexpected fan restore error: " + ex);
+            }
+        }
+
+        private static void SafeTurnOffLed()
+        {
+            LedControl lighting = _lighting;
+
+            if (lighting == null)
+                return;
+
+            try
+            {
+                lighting.TurnOff();
+            }
+            catch (Exception ex)
+            {
+                Log("RGB", "Unexpected LED shutdown error: " + ex);
             }
         }
 

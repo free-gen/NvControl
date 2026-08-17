@@ -17,6 +17,10 @@ Tested on **Palit Dual GeForce RTX 4060**.
 - Multiple GPU / illumination zone selection
 - Console and silent modes
 - Single executable with embedded `NvAPIWrapper.dll`
+- LED shutdown on exit
+- Automatic replacement of an already running instance
+- Optional logging with `-l` / `--log`
+- Configurable minimum manual fan speed with AUTO/STOP fallback
 
 ## Requirements
 
@@ -38,6 +42,16 @@ Silent mode:
 ```bat
 NvControl.exe -s
 ```
+
+Enable logging (Logging is disabled by default.):
+
+```bat
+NvControl.exe -l
+```
+
+Starting NvControl while another instance is already running will gracefully stop the old instance and start the new one.
+
+On shutdown, NvControl restores automatic fan control and turns GPU lighting off.
 
 On first launch, `config.cfg` is created next to the executable.
 
@@ -66,7 +80,7 @@ STATUS_P4=90,FF0000,60
 FAN_CONTROL=TRUE
 FAN_MODE=CURVE
 FAN_SPEED=30
-MIN_SPEED=30
+MIN_SPEED=30 # defines the minimum usable manual fan speed. Fan curve values below this threshold are treated as AUTO/STOP.
 FAN_COOLER_ID=0
 FAN_RESTORE_ON_EXIT=TRUE
 

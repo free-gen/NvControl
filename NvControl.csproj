@@ -6,8 +6,8 @@
     <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
     <ApplicationIcon>app.ico</ApplicationIcon>
     <AssemblyTitle>NvControl</AssemblyTitle>
-    <AssemblyVersion>0.0.4</AssemblyVersion>
-    <AssemblyFileVersion>0.0.4</AssemblyFileVersion>
+    <AssemblyVersion>0.0.5</AssemblyVersion>
+    <AssemblyFileVersion>0.0.5</AssemblyFileVersion>
     <Company>FreeGen</Company>
     <ApplicationManifest>app.manifest</ApplicationManifest>
   </PropertyGroup>
