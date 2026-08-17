@@ -1,509 +1,533 @@
 using System;
-using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using System.Runtime.InteropServices;
-using System.Text.RegularExpressions;
+using System.Text;
 using System.Threading;
-using NvAPIWrapper.GPU;
 
 namespace NvControl
 {
-    internal class Program
+    internal static class Program
     {
-        private const int UPDATE_INTERVAL_MS = 50;
-        private static Config _config;
-        private static NvApi.NV_ILLUM_PARAMS _illumParams;
-        private static int _zoneIndex = -1;
-        private static IntPtr _hGpu;
-        private static bool _running = true;
+        private const int RGB_TICK_MS = 50;
+        private const int TEMPERATURE_POLL_MS = 500;
+        private const int CONSOLE_REFRESH_MS = 250;
+        private const long MAX_LOG_SIZE = 1024L * 1024L;
+
+        private static volatile bool _running = true;
         private static bool _showConsole;
+        private static bool _logEnabled;
+        private static bool _consoleAllocated;
 
-        // ---- COLOR STATE ----
-        private static double _currentR = -1, _currentG = -1, _currentB = -1, _currentBrightness = -1;
-        private static int _lastSentR = -1, _lastSentG = -1, _lastSentB = -1, _lastSentBrightness = -1;
-        private static string _lastColor = "";
+        private static Config _config;
+        private static LedControl _lighting;
+        private static FanControl _fan;
+        private static Mutex _singleInstanceMutex;
+        private static ConsoleCtrlHandler _consoleHandler;
 
-        // ---- FAN STATE ----
-        private static PhysicalGPU _physicalGpu = null;
-        private static GPUCoolerInformation _coolerInfo = null;
-        private static int _originalFanLevel = -1;
-        private static int _fanCoolerId = 0;
-        private static int _lastSentFanSpeed = -1;
+        private static readonly object LogLock = new object();
 
-        // ---- CONSOLE OUTPUT ----
-        private static int _consoleStartRow = 0;
+        private static string _logPath;
+        private static int _consoleStartRow;
 
-        // ---- CONSOLE CONTROL HANDLER ----
-        private delegate bool ConsoleCtrlHandler(int dwCtrlType);
-        [DllImport("kernel32.dll")]
-        private static extern bool SetConsoleCtrlHandler(ConsoleCtrlHandler handler, bool add);
-        private static ConsoleCtrlHandler _consoleHandler = null;
-
-        [DllImport("kernel32.dll")] private static extern bool AllocConsole();
-        [DllImport("kernel32.dll")] private static extern bool FreeConsole();
+        private delegate bool ConsoleCtrlHandler(int ctrlType);
 
         private static void Main(string[] args)
         {
-            // KILL OTHER INSTANCES
-            string name = Process.GetCurrentProcess().ProcessName;
-            foreach (var p in Process.GetProcessesByName(name))
-                if (p.Id != Process.GetCurrentProcess().Id) try { p.Kill(); p.WaitForExit(500); } catch { }
-
-            // ARGUMENTS
-            _showConsole = !args.Any(a => a.Equals("-s", StringComparison.OrdinalIgnoreCase) ||
-                                          a.Equals("--silent", StringComparison.OrdinalIgnoreCase));
-            if (_showConsole)
-            {
-                AllocConsole();
-                Console.Title = "NvControl";
-            }
+            bool ownsMutex = false;
 
             try
             {
-                string configPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "config.cfg");
-                _config = Config.Load(configPath) ?? new Config();
-                if (!File.Exists(configPath)) _config.Save(configPath);
+                ownsMutex = AcquireSingleInstance();
 
-                // ---- CONSOLE CONTROL HANDLER ----
-                _consoleHandler = new ConsoleCtrlHandler(OnConsoleCtrl);
-                SetConsoleCtrlHandler(_consoleHandler, true);
-                AppDomain.CurrentDomain.ProcessExit += (s, e) => RestoreFanControl();
-                Console.CancelKeyPress += (s, e) => { e.Cancel = true; _running = false; };
-
-                // ---- NVAPI/RGB INITIALIZATION ----
-                int paramsSize = Marshal.SizeOf(typeof(NvApi.NV_ILLUM_PARAMS));
-                uint version = (uint)(paramsSize | (1u << 16));
-
-                NvApi.Initialize();
-                _hGpu = NvApi.GetPhysicalGpu(_config.GpuIndex);
-
-                _illumParams = new NvApi.NV_ILLUM_PARAMS
-                {
-                    version = version,
-                    bDefault = 0,
-                    numIllumZonesControl = 0,
-                    reserved = new byte[64],
-                    zones = new NvApi.NV_ILLUM_ZONE[32]
-                };
-                for (int i = 0; i < 32; i++)
-                    _illumParams.zones[i] = new NvApi.NV_ILLUM_ZONE { data = new byte[128], reserved = new byte[64] };
-
-                NvApi.GetIllumination(_hGpu, ref _illumParams);
-
-                // RGB ZONE SELECTION
-                if (_config.IllumZoneIndex != -1)
-                {
-                    int idx = _config.IllumZoneIndex;
-                    if (idx >= 0 && idx < _illumParams.numIllumZonesControl)
-                        _zoneIndex = idx;
-                    else
-                        throw new Exception($"Specified zone index {idx} is invalid (zones count: {_illumParams.numIllumZonesControl})");
-                }
-                else
-                {
-                    for (int i = 0; i < Math.Min(_illumParams.numIllumZonesControl, 32); i++)
-                    {
-                        uint type = _illumParams.zones[i].type;
-                        bool match = false;
-                        if (_config.IllumZoneType == 0)
-                            match = (type == 1 || type == 3);
-                        else if (_config.IllumZoneType == 1)
-                            match = (type == 1);
-                        else if (_config.IllumZoneType == 3)
-                            match = (type == 3);
-                        else
-                            match = (type == 1 || type == 3);
-                        if (match)
-                        {
-                            _zoneIndex = i;
-                            break;
-                        }
-                    }
-                }
-                if (_zoneIndex == -1)
-                {
-                    if (_showConsole) { Console.WriteLine("RGB ZONE NOT FOUND"); Console.ReadLine(); }
+                if (!ownsMutex)
                     return;
-                }
 
-                // ---- FAN INITIALIZATION ----
-                InitializeFanControl();
+                _showConsole = !args.Any(arg =>
+                    arg.Equals("-s", StringComparison.OrdinalIgnoreCase) ||
+                    arg.Equals("--silent", StringComparison.OrdinalIgnoreCase));
 
-                // ---- CONSOLE OUTPUT (only if console is visible) ----
+                _logEnabled = args.Any(arg =>
+                    arg.Equals("-l", StringComparison.OrdinalIgnoreCase) ||
+                    arg.Equals("--log", StringComparison.OrdinalIgnoreCase));
+
+                if (_logEnabled)
+                    InitializeLogging();
+
                 if (_showConsole)
-                {
-                    Console.Clear();
-                    Console.WriteLine(new string('-', 40));
-                    Console.WriteLine($"NvControl v0.0.3 by FreeGen");
-                    Console.WriteLine(new string('-', 40));
-                    Console.WriteLine($"Requires Administrator privileges to control fan speed.");
-                    Console.WriteLine($"For silent mode, use -s or --silent");
-                    Console.WriteLine(new string('-', 40));
-                    Console.WriteLine($"GPU INDEX        : {_config.GpuIndex}");
-                    Console.WriteLine($"ZONE INDEX       : {_zoneIndex} (TYPE: {(_illumParams.zones[_zoneIndex].type == 1 ? "RGB" : "RGBW")})");
-                    Console.WriteLine($"RGB MODE         : {_config.Mode}");
-                    if (_config.FanControl)
-                    {
-                        Console.WriteLine($"FAN CONTROL      : ENABLED");
-                        Console.WriteLine($"FAN MODE         : {_config.FanMode}");
-                        Console.WriteLine($"FAN COOLER ID    : {_fanCoolerId}");
-                        if (_config.FanMode == "STATIC")
-                            Console.WriteLine($"FAN FIXED SPEED  : {_config.FanSpeed}%");
-                    }
-                    else
-                        Console.WriteLine($"FAN CONTROL      : DISABLED");
-                    Console.WriteLine(new string('-', 40));
-                    _consoleStartRow = Console.CursorTop;
-                }
+                    InitializeConsole();
 
-                // ---- MAIN LOOP ----
-                bool needLoop = (_config.Mode == "STATUS") || (_config.FanControl && _config.FanMode == "CURVE");
+                Log("APP", "NvControl starting.");
+
+                string configPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "config.cfg");
+
+                LoadConfiguration(configPath);
+                InstallShutdownHandlers();
+                InitializeHardware();
+                ShowStartupInformation();
+
+                bool needLoop = NeedsBackgroundLoop();
 
                 if (!needLoop)
                 {
-                    SetColor(_config.StaticColor, _config.Brightness);
                     if (_showConsole)
                     {
-                        Console.WriteLine("\nCOLOR SET. PRESS ENTER TO EXIT...");
+                        Console.WriteLine();
+                        Console.WriteLine("Configuration applied.");
+                        Console.WriteLine("Press ENTER to exit...");
                         Console.ReadLine();
                     }
+
                     return;
                 }
 
-                while (_running)
-                {
-                    int temp = GetGpuTemperature();
-
-                    if (_config.Mode == "STATUS")
-                        UpdateColor(temp);
-
-                    if (_config.FanControl && _config.FanMode == "CURVE")
-                        UpdateFanSpeed(temp);
-
-                    if (_showConsole)
-                        DisplayStatus(temp);
-
-                    Thread.Sleep(UPDATE_INTERVAL_MS);
-                }
+                RunLoop();
             }
             catch (Exception ex)
             {
-                if (_showConsole) { Console.WriteLine($"\nERROR: {ex.Message}\nPRESS ENTER TO EXIT..."); Console.ReadLine(); }
-            }
-            finally
-            {
-                RestoreFanControl();
-                if (_showConsole) { Thread.Sleep(500); FreeConsole(); }
-            }
-        }
-
-        // ---- CONSOLE CONTROL HANDLER ----
-        private static bool OnConsoleCtrl(int dwCtrlType)
-        {
-            if (dwCtrlType == 2 || dwCtrlType == 3 || dwCtrlType == 4 || dwCtrlType == 0)
-            {
-                RestoreFanControl();
-                Thread.Sleep(200);
-            }
-            return false;
-        }
-
-        // ---- FAN INITIALIZATION ----
-        private static void InitializeFanControl()
-        {
-            if (!_config.FanControl) return;
-
-            try
-            {
-                var gpus = PhysicalGPU.GetPhysicalGPUs();
-                if (gpus == null || gpus.Length == 0)
-                {
-                    if (_showConsole) Console.WriteLine("NVIDIA GPU NOT FOUND.");
-                    return;
-                }
-
-                int gpuIndex = _config.GpuIndex;
-                if (gpuIndex >= gpus.Length)
-                {
-                    if (_showConsole) Console.WriteLine($"GPU INDEX {gpuIndex} OUT OF RANGE (0-{gpus.Length - 1}), USING 0.");
-                    gpuIndex = 0;
-                }
-                _physicalGpu = gpus[gpuIndex];
-                _coolerInfo = _physicalGpu.CoolerInformation;
-
-                var coolers = _coolerInfo.Coolers;
-                if (coolers == null || !coolers.Any())
-                {
-                    if (_showConsole) Console.WriteLine("NO COOLERS FOUND.");
-                    return;
-                }
-
-                var targetCooler = coolers.FirstOrDefault(c => c.CoolerId == _config.FanCoolerId);
-                if (targetCooler == null)
-                {
-                    targetCooler = coolers.First();
-                    if (_showConsole) Console.WriteLine($"COOLER ID {_config.FanCoolerId} NOT FOUND, USING FIRST (ID={targetCooler.CoolerId})");
-                }
-                _fanCoolerId = targetCooler.CoolerId;
-                _originalFanLevel = targetCooler.CurrentLevel;
+                Log("FATAL", ex.ToString());
 
                 if (_showConsole)
-                    Console.WriteLine($"FAN CONTROL INITIALIZED: COOLER ID={_fanCoolerId}, CURRENT LEVEL={_originalFanLevel}");
-
-                if (_config.FanMode == "STATIC")
-                {
-                    int speed = Clamp(_config.FanSpeed, 0, 100);
-                    _coolerInfo.SetCoolerSettings(_fanCoolerId, speed);
-                    _lastSentFanSpeed = speed;
-                    if (_showConsole) Console.WriteLine($"FAN SPEED SET TO {speed}% (STATIC MODE)");
-                }
-                else if (_config.FanMode == "CURVE")
-                {
-                    if (_showConsole) Console.WriteLine("FAN CURVE MODE ACTIVE.");
-                }
-                else
-                {
-                    if (_showConsole) Console.WriteLine($"UNKNOWN FANMODE: {_config.FanMode}, FAN CONTROL DISABLED.");
-                    _config.FanControl = false; // отключаем, чтобы не мешал
-                }
-            }
-            catch (Exception ex)
-            {
-                if (_showConsole) Console.WriteLine($"FAN INITIALIZATION ERROR: {ex.Message}");
-            }
-        }
-
-        // ---- FAN RESTORE ----
-        private static void RestoreFanControl()
-        {
-            if (!_config.FanRestoreOnExit || _coolerInfo == null) return;
-            if (!_config.FanControl) return;
-
-            try
-            {
-                _coolerInfo.RestoreCoolerSettingsToDefault(new[] { _fanCoolerId });
-                if (_showConsole) Console.WriteLine($"FAN RESTORED TO AUTOMATIC CONTROL (ID={_fanCoolerId})");
-            }
-            catch (Exception ex)
-            {
-                if (_showConsole) Console.WriteLine($"FAN RESTORE ERROR: {ex.Message}");
-            }
-        }
-
-        // ---- GET GPU TEMPERATURE ----
-        private static int GetGpuTemperature()
-        {
-            try { return NvApi.GetGpuTemperature(_hGpu); }
-            catch { return 0; } // fallback
-        }
-
-        // ---- COLOR UPDATE ----
-        private static void UpdateColor(int temp)
-        {
-            try
-            {
-                var (hex, targetBrightness) = GetColorAndBrightnessForTemperature(temp);
-                int tr = Convert.ToInt32(hex.Substring(0, 2), 16);
-                int tg = Convert.ToInt32(hex.Substring(2, 2), 16);
-                int tb = Convert.ToInt32(hex.Substring(4, 2), 16);
-                tr = (int)Math.Round(tr * _config.RedGain);
-                tg = (int)Math.Round(tg * _config.GreenGain);
-                tb = (int)Math.Round(tb * _config.BlueGain);
-                tr = Clamp(tr, 0, 255);
-                tg = Clamp(tg, 0, 255);
-                tb = Clamp(tb, 0, 255);
-                targetBrightness = Clamp(targetBrightness, 0, 100);
-
-                if (_currentR == -1) { _currentR = tr; _currentG = tg; _currentB = tb; _currentBrightness = targetBrightness; _lastColor = hex; }
-
-                if (hex != _lastColor || Math.Abs(_currentBrightness - targetBrightness) > 0.5)
-                {
-                    _lastColor = hex;
-                }
-
-                double s = _config.Smoothing;
-                _currentR += (tr - _currentR) * s;
-                _currentG += (tg - _currentG) * s;
-                _currentB += (tb - _currentB) * s;
-                _currentBrightness += (targetBrightness - _currentBrightness) * s;
-
-                if (Math.Abs(tr - _currentR) < 0.5 && Math.Abs(tg - _currentG) < 0.5 &&
-                    Math.Abs(tb - _currentB) < 0.5 && Math.Abs(targetBrightness - _currentBrightness) < 0.5)
-                {
-                    _currentR = tr; _currentG = tg; _currentB = tb; _currentBrightness = targetBrightness;
-                }
-
-                int finalR = (int)Math.Round(_currentR);
-                int finalG = (int)Math.Round(_currentG);
-                int finalB = (int)Math.Round(_currentB);
-                int finalBrightness = (int)Math.Round(_currentBrightness);
-
-                if (finalR != _lastSentR || finalG != _lastSentG || finalB != _lastSentB || finalBrightness != _lastSentBrightness)
                 {
                     try
                     {
-                        SetColor(finalR, finalG, finalB, finalBrightness);
-                        _lastSentR = finalR; _lastSentG = finalG; _lastSentB = finalB; _lastSentBrightness = finalBrightness;
+                        Console.WriteLine();
+                        Console.WriteLine("ERROR: " + ex.Message);
+                        Console.WriteLine();
+                        if (_logEnabled)
+                            Console.WriteLine("See NvControl.log for details.");
+
+                        Console.WriteLine("Press ENTER to exit...");
+                        Console.ReadLine();
                     }
-                    catch { }
+                    catch
+                    {
+                    }
                 }
             }
-            catch { }
-        }
-
-        // ---- SET COLOR ----
-        private static void SetColor(string hex, int brightness)
-        {
-            if (string.IsNullOrEmpty(hex) || hex.Length != 6 || !Regex.IsMatch(hex, "^[0-9A-Fa-f]{6}$"))
+            finally
             {
-                if (_showConsole) Console.WriteLine($"INVALID COLOR: {hex}");
-                return;
-            }
-            int r = (int)Math.Round(Convert.ToInt32(hex.Substring(0, 2), 16) * _config.RedGain);
-            int g = (int)Math.Round(Convert.ToInt32(hex.Substring(2, 2), 16) * _config.GreenGain);
-            int b = (int)Math.Round(Convert.ToInt32(hex.Substring(4, 2), 16) * _config.BlueGain);
-            SetColor(Clamp(r, 0, 255), Clamp(g, 0, 255), Clamp(b, 0, 255), Clamp(brightness, 0, 100));
-        }
+                SafeRestoreFan();
 
-        // ---- COLOR SETUP ----
-        private static void SetColor(int r, int g, int b, int brightness)
-        {
-            var zone = _illumParams.zones[_zoneIndex];
-            zone.ctrlMode = (uint)_config.CtrlMode;
-
-            if (zone.type == 3) // RGBW
-            {
-                zone.data[_config.RgbwROffset] = (byte)r;
-                zone.data[_config.RgbwGOffset] = (byte)g;
-                zone.data[_config.RgbwBOffset] = (byte)b;
-                zone.data[_config.RgbwWOffset] = 0;
-                zone.data[_config.RgbwBrightnessOffset] = (byte)brightness;
-            }
-            else // RGB
-            {
-                zone.data[_config.RgbROffset] = (byte)r;
-                zone.data[_config.RgbGOffset] = (byte)g;
-                zone.data[_config.RgbBOffset] = (byte)b;
-                zone.data[_config.RgbBrightnessOffset] = (byte)brightness;
-            }
-
-            _illumParams.zones[_zoneIndex] = zone;
-            NvApi.SetIllumination(_hGpu, ref _illumParams);
-        }
-
-        // ---- COLOR AND BRIGHTNESS CALCULATION ----
-        private static (string Color, int Brightness) GetColorAndBrightnessForTemperature(int temp)
-        {
-            var pts = _config.TemperaturePoints.OrderBy(p => p.Temp).ToList();
-            if (pts.Count == 0) return ("FF0000", _config.Brightness);
-            if (temp <= pts[0].Temp) return (pts[0].Color, pts[0].Brightness > 0 ? pts[0].Brightness : _config.Brightness);
-            if (temp >= pts[pts.Count - 1].Temp) return (pts[pts.Count - 1].Color, pts[pts.Count - 1].Brightness > 0 ? pts[pts.Count - 1].Brightness : _config.Brightness);
-
-            for (int i = 0; i < pts.Count - 1; i++)
-            {
-                int t1 = pts[i].Temp, t2 = pts[i + 1].Temp;
-                if (temp >= t1 && temp <= t2)
-                {
-                    float f = (float)(temp - t1) / (t2 - t1);
-                    string c1 = pts[i].Color, c2 = pts[i + 1].Color;
-                    int r1 = Convert.ToInt32(c1.Substring(0, 2), 16);
-                    int g1 = Convert.ToInt32(c1.Substring(2, 2), 16);
-                    int b1 = Convert.ToInt32(c1.Substring(4, 2), 16);
-                    int r2 = Convert.ToInt32(c2.Substring(0, 2), 16);
-                    int g2 = Convert.ToInt32(c2.Substring(2, 2), 16);
-                    int b2 = Convert.ToInt32(c2.Substring(4, 2), 16);
-                    int r = (int)(r1 + (r2 - r1) * f);
-                    int g = (int)(g1 + (g2 - g1) * f);
-                    int b = (int)(b1 + (b2 - b1) * f);
-                    int b1v = pts[i].Brightness > 0 ? pts[i].Brightness : _config.Brightness;
-                    int b2v = pts[i + 1].Brightness > 0 ? pts[i + 1].Brightness : _config.Brightness;
-                    return ($"{r:X2}{g:X2}{b:X2}", (int)(b1v + (b2v - b1v) * f));
-                }
-            }
-            return (pts[pts.Count - 1].Color, pts[pts.Count - 1].Brightness > 0 ? pts[pts.Count - 1].Brightness : _config.Brightness);
-        }
-
-        // ---- FAN SPEED CALCULATION ----
-        private static int GetFanSpeedForTemperature(int temp)
-        {
-            var pts = _config.FanCurvePoints.OrderBy(p => p.Temp).ToList();
-            if (pts.Count == 0) return 30; // значение по умолчанию
-            if (temp <= pts[0].Temp) return Clamp(pts[0].Speed, 0, 100);
-            if (temp >= pts[pts.Count - 1].Temp) return Clamp(pts[pts.Count - 1].Speed, 0, 100);
-
-            for (int i = 0; i < pts.Count - 1; i++)
-            {
-                int t1 = pts[i].Temp, t2 = pts[i + 1].Temp;
-                if (temp >= t1 && temp <= t2)
-                {
-                    float f = (float)(temp - t1) / (t2 - t1);
-                    int s1 = pts[i].Speed, s2 = pts[i + 1].Speed;
-                    int speed = (int)(s1 + (s2 - s1) * f);
-                    return Clamp(speed, 0, 100);
-                }
-            }
-            return Clamp(pts[pts.Count - 1].Speed, 0, 100);
-        }
-
-        // ---- FAN UPDATE ----
-        private static void UpdateFanSpeed(int temp)
-        {
-            if (_coolerInfo == null) return;
-
-            int targetSpeed = GetFanSpeedForTemperature(temp);
-            targetSpeed = Clamp(targetSpeed, 0, 100);
-
-            if (targetSpeed != _lastSentFanSpeed)
-            {
                 try
                 {
-                    _coolerInfo.SetCoolerSettings(_fanCoolerId, targetSpeed);
-                    _lastSentFanSpeed = targetSpeed;
+                    NvApi.Shutdown();
                 }
-                catch { }
+                catch (Exception ex)
+                {
+                    Log("NVAPI", "Shutdown failed: " + ex.Message);
+                }
+
+                Log("APP", "NvControl stopped.");
+
+                if (_consoleAllocated)
+                {
+                    try
+                    {
+                        FreeConsole();
+                    }
+                    catch
+                    {
+                    }
+                }
+
+                if (ownsMutex && _singleInstanceMutex != null)
+                {
+                    try
+                    {
+                        _singleInstanceMutex.ReleaseMutex();
+                    }
+                    catch
+                    {
+                    }
+                }
+
+                if (_singleInstanceMutex != null)
+                {
+                    _singleInstanceMutex.Dispose();
+                    _singleInstanceMutex = null;
+                }
             }
         }
 
-        // ---- CONSOLE DISPLAY ----
-        private static void DisplayStatus(int temp)
+        private static bool AcquireSingleInstance()
         {
-            if (!_showConsole) return;
+            bool createdNew;
+            _singleInstanceMutex = new Mutex(true, "FreeGen.NvControl.SingleInstance", out createdNew);
+            return createdNew;
+        }
 
-            // RGB STRING
-            string colorHex = _lastColor;
-            if (string.IsNullOrEmpty(colorHex))
-                colorHex = "------";
-            int brightness = (int)Math.Round(_currentBrightness);
-            if (brightness < 0) brightness = 0;
-            string rgbLine = $"RGB : {temp,2}°C --> {colorHex} {brightness,3}%";
-
-            // FAN STRING
-            string fanLine;
-            if (_config.FanControl)
+        private static void LoadConfiguration(string path)
+        {
+            if (File.Exists(path))
             {
-                int speed = _lastSentFanSpeed >= 0 ? _lastSentFanSpeed : 0;
-                fanLine = $"FAN : {temp,2}°C --> {speed,5}%";
+                _config = Config.Load(path);
             }
             else
             {
-                fanLine = "FAN : DISABLED";
+                _config = new Config();
+                _config.Validate();
+                _config.Save(path);
+
+                Log("CONFIG", "Created default config.cfg.");
             }
 
-            int left = 0;
-            int top = _consoleStartRow;
-            Console.SetCursorPosition(left, top);
-            Console.Write(rgbLine.PadRight(Console.WindowWidth - 1));
-            top++;
-            Console.SetCursorPosition(left, top);
-            Console.Write(fanLine.PadRight(Console.WindowWidth - 1));
+            if (_config == null)
+                throw new InvalidOperationException("Configuration could not be loaded.");
+
+            _config.Validate();
+
+            Log("CONFIG", "Configuration loaded and validated.");
         }
 
-        // ---- HELPER CLAMP ----
-        private static int Clamp(int value, int min, int max)
+        private static void InitializeHardware()
         {
-            return value < min ? min : (value > max ? max : value);
+            // NvAPIWrapper is needed for fan control and temperature monitoring.
+            bool needWrapper = _config.FanControl || _config.Mode == LightingMode.Status;
+
+            if (needWrapper)
+            {
+                try
+                {
+                    _fan = new FanControl(_config, message => Log("FAN", message));
+                    _fan.Initialize();
+                }
+                catch (Exception ex)
+                {
+                    Log("FAN", "NvAPIWrapper initialization failed: " + ex);
+
+                    if (_showConsole)
+                        Console.WriteLine("FAN/TEMP ERROR: " + ex.Message);
+
+                    _fan = null;
+                }
+            }
+
+            // Illumination uses the direct NVAPI layer.
+            try
+            {
+                NvApi.Initialize();
+
+                IntPtr gpu = NvApi.GetPhysicalGpu(_config.GpuIndex);
+
+                _lighting = new LedControl(_config, message => Log("RGB", message));
+                _lighting.Initialize(gpu);
+
+                if (_config.Mode == LightingMode.Static)
+                    _lighting.ApplyStatic();
+            }
+            catch (Exception ex)
+            {
+                Log("RGB", "Lighting initialization failed: " + ex);
+
+                if (_showConsole)
+                    Console.WriteLine("RGB ERROR: " + ex.Message);
+
+                _lighting = null;
+            }
         }
+
+        private static bool NeedsBackgroundLoop()
+        {
+            bool fanNeedsLoop = _fan != null && _fan.RequiresBackgroundLoop;
+            bool rgbNeedsLoop = _lighting != null && _lighting.IsDynamic && _fan != null && _fan.IsInitialized;
+
+            return fanNeedsLoop || rgbNeedsLoop;
+        }
+
+        private static void RunLoop()
+        {
+            Stopwatch clock = Stopwatch.StartNew();
+
+            long nextTemperaturePoll = 0;
+            long nextConsoleRefresh = 0;
+
+            int currentTemperature = 0;
+            bool haveTemperature = false;
+
+            while (_running)
+            {
+                long now = clock.ElapsedMilliseconds;
+
+                if (_fan != null && now >= nextTemperaturePoll)
+                {
+                    int temperature;
+                    bool valid = _fan.TryReadTemperature(out temperature);
+
+                    if (valid)
+                    {
+                        currentTemperature = temperature;
+                        haveTemperature = true;
+
+                        if (_lighting != null && _lighting.IsDynamic)
+                            _lighting.UpdateTemperature(temperature);
+
+                        _fan.UpdateFanForTemperature(temperature);
+                    }
+
+                    // Failed reads are never fed into RGB/fan curves.
+                    nextTemperaturePoll = now + TEMPERATURE_POLL_MS;
+                }
+
+                if (_lighting != null && _lighting.IsDynamic)
+                    _lighting.Tick();
+
+                if (_showConsole && now >= nextConsoleRefresh)
+                {
+                    DisplayStatus(currentTemperature, haveTemperature);
+                    nextConsoleRefresh = now + CONSOLE_REFRESH_MS;
+                }
+
+                Thread.Sleep(RGB_TICK_MS);
+            }
+        }
+
+        private static void InitializeConsole()
+        {
+            if (!AllocConsole())
+                return;
+
+            _consoleAllocated = true;
+            Console.Title = "NvControl";
+        }
+
+        private static void ShowStartupInformation()
+        {
+            if (!_showConsole || !_consoleAllocated)
+                return;
+
+            Console.Clear();
+
+            string version = Assembly.GetExecutingAssembly().GetName().Version.ToString();
+
+            Console.WriteLine(new string('-', 48));
+            Console.WriteLine("NvControl v" + version + " by FreeGen");
+            Console.WriteLine(new string('-', 48));
+            Console.WriteLine("GPU INDEX       : " + _config.GpuIndex);
+
+            if (_lighting != null)
+            {
+                Console.WriteLine("RGB ZONE        : " + _lighting.ZoneIndex + " (" + _lighting.ZoneTypeName + ")");
+                Console.WriteLine("RGB MODE        : " + _config.Mode.ToString().ToUpperInvariant());
+            }
+            else
+            {
+                Console.WriteLine("RGB             : UNAVAILABLE");
+            }
+
+            if (!_config.FanControl)
+            {
+                Console.WriteLine("FAN             : DISABLED");
+            }
+            else if (_fan != null)
+            {
+                Console.WriteLine("FAN MODE        : " + _config.FanMode.ToString().ToUpperInvariant());
+                Console.WriteLine("FAN COOLER ID   : " + _fan.CoolerId);
+            }
+            else
+            {
+                Console.WriteLine("FAN             : UNAVAILABLE");
+            }
+
+            Console.WriteLine("LOG             : " + (_logEnabled ? _logPath : "DISABLED"));
+            Console.WriteLine(new string('-', 48));
+
+            _consoleStartRow = Console.CursorTop;
+        }
+
+        private static void DisplayStatus(int temperature, bool haveTemperature)
+        {
+            if (!_showConsole || !_consoleAllocated)
+                return;
+
+            try
+            {
+                string temperatureText = haveTemperature ? temperature + " °C" : "-- °C";
+
+                string rgbText = _lighting == null
+                    ? "RGB  : UNAVAILABLE"
+                    : "RGB  : " + _lighting.CurrentColorHex + "  " + _lighting.CurrentBrightness + "%";
+
+                string fanText = _fan == null
+                    ? (_config.FanControl ? "FAN  : UNAVAILABLE" : "FAN  : DISABLED")
+                    : "FAN  : " + _fan.StatusText;
+
+                WriteStatusLine(0, "TEMP : " + temperatureText);
+                WriteStatusLine(1, rgbText);
+                WriteStatusLine(2, fanText);
+            }
+            catch
+            {
+                // Console may disappear asynchronously during shutdown.
+            }
+        }
+
+        private static void WriteStatusLine(int offset, string text)
+        {
+            int width = Math.Max(1, Console.WindowWidth - 1);
+
+            if (text.Length > width)
+                text = text.Substring(0, width);
+            else
+                text = text.PadRight(width);
+
+            Console.SetCursorPosition(0, _consoleStartRow + offset);
+            Console.Write(text);
+        }
+
+        private static void InstallShutdownHandlers()
+        {
+            _consoleHandler = new ConsoleCtrlHandler(OnConsoleControl);
+            SetConsoleCtrlHandler(_consoleHandler, true);
+
+            AppDomain.CurrentDomain.ProcessExit += delegate
+            {
+                SafeRestoreFan();
+            };
+
+            Console.CancelKeyPress += delegate(object sender, ConsoleCancelEventArgs eventArgs)
+            {
+                eventArgs.Cancel = true;
+                _running = false;
+            };
+        }
+
+        private static bool OnConsoleControl(int ctrlType)
+        {
+            // 0 = CTRL_C, 1 = CTRL_BREAK, 2 = CTRL_CLOSE, 5 = LOGOFF, 6 = SHUTDOWN
+            if (ctrlType == 0 || ctrlType == 1 || ctrlType == 2 || ctrlType == 5 || ctrlType == 6)
+            {
+                _running = false;
+                SafeRestoreFan();
+            }
+
+            return false;
+        }
+
+        private static void SafeRestoreFan()
+        {
+            FanControl fan = _fan;
+
+            if (fan == null)
+                return;
+
+            try
+            {
+                fan.RestoreOnExit();
+            }
+            catch (Exception ex)
+            {
+                Log("FAN", "Unexpected fan restore error: " + ex);
+            }
+        }
+
+        private static void InitializeLogging()
+        {
+            string appDirectory = AppDomain.CurrentDomain.BaseDirectory;
+            string preferred = Path.Combine(appDirectory, "NvControl.log");
+
+            if (CanUseLogPath(preferred))
+            {
+                _logPath = preferred;
+                return;
+            }
+
+            string fallbackDirectory = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "NvControl");
+
+            Directory.CreateDirectory(fallbackDirectory);
+            _logPath = Path.Combine(fallbackDirectory, "NvControl.log");
+        }
+
+        private static bool CanUseLogPath(string path)
+        {
+            try
+            {
+                string directory = Path.GetDirectoryName(path);
+
+                if (!string.IsNullOrEmpty(directory))
+                    Directory.CreateDirectory(directory);
+
+                using (FileStream stream = new FileStream(
+                    path,
+                    FileMode.OpenOrCreate,
+                    FileAccess.Write,
+                    FileShare.ReadWrite))
+                {
+                }
+
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static void Log(string subsystem, string message)
+        {
+            if (!_logEnabled)
+                return;
+
+            try
+            {
+                lock (LogLock)
+                {
+                    RotateLogIfNeeded();
+
+                    string line =
+                        DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff") +
+                        " [" + subsystem + "] " +
+                        message +
+                        Environment.NewLine;
+
+                    File.AppendAllText(_logPath, line, new UTF8Encoding(false));
+                }
+            }
+            catch
+            {
+                // Logging must never crash hardware cleanup.
+            }
+        }
+
+        private static void RotateLogIfNeeded()
+        {
+            if (string.IsNullOrEmpty(_logPath) || !File.Exists(_logPath))
+                return;
+
+            var info = new FileInfo(_logPath);
+
+            if (info.Length < MAX_LOG_SIZE)
+                return;
+
+            string oldLog = _logPath + ".old";
+
+            try
+            {
+                if (File.Exists(oldLog))
+                    File.Delete(oldLog);
+
+                File.Move(_logPath, oldLog);
+            }
+            catch
+            {
+                // Rotation failure should not prevent logging.
+            }
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool AllocConsole();
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool FreeConsole();
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool SetConsoleCtrlHandler(ConsoleCtrlHandler handler, bool add);
     }
 }

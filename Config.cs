@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Text;
@@ -7,49 +8,98 @@ using System.Text.RegularExpressions;
 
 namespace NvControl
 {
-    public class Config
+    public enum LightingMode
     {
-        // ---- RGB ----
-        public string Mode { get; set; } = "STATUS";
+        Static,
+        Status
+    }
+
+    public enum FanControlMode
+    {
+        Static,
+        Curve
+    }
+
+    public sealed class LightingCurvePoint
+    {
+        public int Temperature { get; set; }
+        public string Color { get; set; }
+
+        // -1 = use global BRIGHTNESS, 0..100 = literal brightness
+        public int Brightness { get; set; }
+
+        public LightingCurvePoint()
+        {
+        }
+
+        public LightingCurvePoint(int temperature, string color, int brightness)
+        {
+            Temperature = temperature;
+            Color = color;
+            Brightness = brightness;
+        }
+    }
+
+    public sealed class FanCurvePoint
+    {
+        public int Temperature { get; set; }
+        public int Speed { get; set; }
+
+        public FanCurvePoint()
+        {
+        }
+
+        public FanCurvePoint(int temperature, int speed)
+        {
+            Temperature = temperature;
+            Speed = speed;
+        }
+    }
+
+    public sealed class Config
+    {
+        // RGB
+        public LightingMode Mode { get; set; } = LightingMode.Status;
         public int Brightness { get; set; } = 15;
         public string StaticColor { get; set; } = "FF4000";
         public double RedGain { get; set; } = 1.00;
         public double GreenGain { get; set; } = 0.65;
         public double BlueGain { get; set; } = 0.90;
+
+        // 0 < Smoothing <= 1. Lower = slower, higher = faster.
         public double Smoothing { get; set; } = 0.15;
-        public List<(int Temp, string Color, int Brightness)> TemperaturePoints { get; set; } = new List<(int, string, int)>
+
+        public List<LightingCurvePoint> TemperaturePoints { get; set; } = new List<LightingCurvePoint>
         {
-            (0, "FF4000", 15), (49, "FF4000", 15), (50, "FF8000", 30), (90, "FF0000", 60)
+            new LightingCurvePoint(0, "FF4000", 15),
+            new LightingCurvePoint(49, "FF4000", 15),
+            new LightingCurvePoint(50, "FF8000", 30),
+            new LightingCurvePoint(90, "FF0000", 60)
         };
 
-        // ---- NVAPI ----
+        // GPU / illumination
         public int GpuIndex { get; set; } = 0;
-        public int IllumZoneIndex { get; set; } = -1;
-        public int IllumZoneType { get; set; } = 0;          // 0=AUTO, 1=RGB, 3=RGBW
-        public int RgbROffset { get; set; } = 0;
-        public int RgbGOffset { get; set; } = 1;
-        public int RgbBOffset { get; set; } = 2;
-        public int RgbBrightnessOffset { get; set; } = 3;
-        public int RgbwROffset { get; set; } = 0;
-        public int RgbwGOffset { get; set; } = 1;
-        public int RgbwBOffset { get; set; } = 2;
-        public int RgbwWOffset { get; set; } = 3;
-        public int RgbwBrightnessOffset { get; set; } = 4;
-        public int CtrlMode { get; set; } = 0;
+        public int IllumZoneIndex { get; set; } = -1; // -1 = automatic
+        public int IllumZoneType { get; set; } = 0;   // 0 = auto, 1 = RGB, 3 = RGBW
 
-        // ---- FAN CONTROL ----
+        // Fan
         public bool FanControl { get; set; } = true;
-        public string FanMode { get; set; } = "CURVE";
+        public FanControlMode FanMode { get; set; } = FanControlMode.Curve;
         public int FanSpeed { get; set; } = 30;
+        public int MinFanSpeed { get; set; } = 30;
         public int FanCoolerId { get; set; } = 0;
         public bool FanRestoreOnExit { get; set; } = true;
 
-        public List<(int Temp, int Speed)> FanCurvePoints { get; set; } = new List<(int, int)>
+        public List<FanCurvePoint> FanCurvePoints { get; set; } = new List<FanCurvePoint>
         {
-            (0, 0), (50, 30), (60, 40), (70, 50), (80, 60), (90, 70)
+            new FanCurvePoint(0, 0),
+            new FanCurvePoint(40, 30),
+            new FanCurvePoint(60, 40),
+            new FanCurvePoint(70, 50),
+            new FanCurvePoint(80, 60),
+            new FanCurvePoint(90, 70)
         };
 
-        // ---- KEYS SAVE/LOAD ----
         private const string KEY_MODE = "MODE";
         private const string KEY_BRIGHTNESS = "BRIGHTNESS";
         private const string KEY_STATIC_COLOR = "STATIC_COLOR";
@@ -62,216 +112,457 @@ namespace NvControl
         private const string KEY_GPU_INDEX = "GPU_INDEX";
         private const string KEY_ILLUM_ZONE_INDEX = "ILLUM_ZONE_INDEX";
         private const string KEY_ILLUM_ZONE_TYPE = "ILLUM_ZONE_TYPE";
-        private const string KEY_RGB_R_OFFSET = "RGB_R_OFFSET";
-        private const string KEY_RGB_G_OFFSET = "RGB_G_OFFSET";
-        private const string KEY_RGB_B_OFFSET = "RGB_B_OFFSET";
-        private const string KEY_RGB_BRIGHTNESS_OFFSET = "RGB_BRIGHTNESS_OFFSET";
-        private const string KEY_RGBW_R_OFFSET = "RGBW_R_OFFSET";
-        private const string KEY_RGBW_G_OFFSET = "RGBW_G_OFFSET";
-        private const string KEY_RGBW_B_OFFSET = "RGBW_B_OFFSET";
-        private const string KEY_RGBW_W_OFFSET = "RGBW_W_OFFSET";
-        private const string KEY_RGBW_BRIGHTNESS_OFFSET = "RGBW_BRIGHTNESS_OFFSET";
-        private const string KEY_CTRL_MODE = "CTRL_MODE";
 
-        // FAN KEYS
         private const string KEY_FAN_CONTROL = "FAN_CONTROL";
         private const string KEY_FAN_MODE = "FAN_MODE";
         private const string KEY_FAN_SPEED = "FAN_SPEED";
+        private const string KEY_MIN_SPEED = "MIN_SPEED";
         private const string KEY_FAN_COOLER_ID = "FAN_COOLER_ID";
         private const string KEY_FAN_RESTORE_ON_EXIT = "FAN_RESTORE_ON_EXIT";
         private const string KEY_FAN_CURVE_PREFIX = "FAN_P";
 
-        // OLD FAN KEYS
+        // Legacy fan keys
         private const string KEY_FAN_MANUAL_OLD = "FAN_MANUAL";
         private const string KEY_FAN_CURVE_ENABLED_OLD = "FAN_CURVE_ENABLED";
 
         public static Config Load(string path)
         {
-            if (!File.Exists(path)) return null;
-            var cfg = new Config();
-            var lines = File.ReadAllLines(path, Encoding.UTF8);
-            var tempPoints = new Dictionary<int, (int Temp, string Color, int Brightness)>();
-            var fanPoints = new Dictionary<int, (int Temp, int Speed)>();
+            if (!File.Exists(path))
+                return null;
+
+            var config = new Config();
+            string[] lines = File.ReadAllLines(path, Encoding.UTF8);
+
+            var lightingPoints = new Dictionary<int, LightingCurvePoint>();
+            var fanPoints = new Dictionary<int, FanCurvePoint>();
 
             bool oldManual = false;
             bool oldCurve = false;
+            bool sawFanControl = false;
 
-            foreach (var raw in lines)
+            for (int lineIndex = 0; lineIndex < lines.Length; lineIndex++)
             {
-                string line = raw.Trim();
-                if (string.IsNullOrEmpty(line) || line.StartsWith(";") || line.StartsWith("#")) continue;
-                int eq = line.IndexOf('=');
-                if (eq <= 0) continue;
-                string key = line.Substring(0, eq).Trim().ToUpperInvariant();
-                string val = line.Substring(eq + 1).Trim();
+                string line = lines[lineIndex].Trim();
 
-                int commentIdx = val.IndexOfAny(new char[] { '#', ';' });
-                if (commentIdx >= 0) val = val.Substring(0, commentIdx).Trim();
+                if (string.IsNullOrEmpty(line) || line.StartsWith("#") || line.StartsWith(";"))
+                    continue;
+
+                int equalsIndex = line.IndexOf('=');
+                if (equalsIndex <= 0)
+                    continue;
+
+                string key = line.Substring(0, equalsIndex).Trim().ToUpperInvariant();
+                string value = RemoveInlineComment(line.Substring(equalsIndex + 1).Trim());
+                int configLine = lineIndex + 1;
 
                 switch (key)
                 {
-                    case KEY_MODE: cfg.Mode = val.ToUpperInvariant(); break;
-                    case KEY_BRIGHTNESS: if (int.TryParse(val, out int b)) cfg.Brightness = b; break;
-                    case KEY_STATIC_COLOR: cfg.StaticColor = val; break;
-                    case KEY_R_GAIN: if (double.TryParse(val, System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out double rg)) cfg.RedGain = rg; break;
-                    case KEY_G_GAIN: if (double.TryParse(val, System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out double gg)) cfg.GreenGain = gg; break;
-                    case KEY_B_GAIN: if (double.TryParse(val, System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out double bg)) cfg.BlueGain = bg; break;
-                    case KEY_SMOOTHING: if (double.TryParse(val, System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out double sm)) cfg.Smoothing = sm; break;
-                    case KEY_GPU_INDEX: if (int.TryParse(val, out int gpuIdx)) cfg.GpuIndex = gpuIdx; break;
-                    case KEY_ILLUM_ZONE_INDEX: if (int.TryParse(val, out int zoneIdx)) cfg.IllumZoneIndex = zoneIdx; break;
-                    case KEY_ILLUM_ZONE_TYPE: if (int.TryParse(val, out int zoneType)) cfg.IllumZoneType = zoneType; break;
-                    case KEY_RGB_R_OFFSET: if (int.TryParse(val, out int rOff)) cfg.RgbROffset = rOff; break;
-                    case KEY_RGB_G_OFFSET: if (int.TryParse(val, out int gOff)) cfg.RgbGOffset = gOff; break;
-                    case KEY_RGB_B_OFFSET: if (int.TryParse(val, out int bOff)) cfg.RgbBOffset = bOff; break;
-                    case KEY_RGB_BRIGHTNESS_OFFSET: if (int.TryParse(val, out int brOff)) cfg.RgbBrightnessOffset = brOff; break;
-                    case KEY_RGBW_R_OFFSET: if (int.TryParse(val, out int rwOff)) cfg.RgbwROffset = rwOff; break;
-                    case KEY_RGBW_G_OFFSET: if (int.TryParse(val, out int gwOff)) cfg.RgbwGOffset = gwOff; break;
-                    case KEY_RGBW_B_OFFSET: if (int.TryParse(val, out int bwOff)) cfg.RgbwBOffset = bwOff; break;
-                    case KEY_RGBW_W_OFFSET: if (int.TryParse(val, out int wOff)) cfg.RgbwWOffset = wOff; break;
-                    case KEY_RGBW_BRIGHTNESS_OFFSET: if (int.TryParse(val, out int bwBrOff)) cfg.RgbwBrightnessOffset = bwBrOff; break;
-                    case KEY_CTRL_MODE: if (int.TryParse(val, out int ctrl)) cfg.CtrlMode = ctrl; break;
+                    case KEY_MODE:
+                        config.Mode = ParseLightingMode(value, configLine);
+                        break;
 
-                    case KEY_FAN_CONTROL: bool.TryParse(val, out bool fc); cfg.FanControl = fc; break;
-                    case KEY_FAN_MODE: cfg.FanMode = val.ToUpperInvariant(); break;
-                    case KEY_FAN_SPEED: int.TryParse(val, out int fs); cfg.FanSpeed = fs; break;
-                    case KEY_FAN_COOLER_ID: int.TryParse(val, out int fci); cfg.FanCoolerId = fci; break;
-                    case KEY_FAN_RESTORE_ON_EXIT: bool.TryParse(val, out bool froe); cfg.FanRestoreOnExit = froe; break;
+                    case KEY_BRIGHTNESS:
+                        config.Brightness = ParseInt(value, key, configLine);
+                        break;
 
-                    case KEY_FAN_MANUAL_OLD: bool.TryParse(val, out bool fm); oldManual = fm; break;
-                    case KEY_FAN_CURVE_ENABLED_OLD: bool.TryParse(val, out bool fce); oldCurve = fce; break;
+                    case KEY_STATIC_COLOR:
+                        config.StaticColor = value.ToUpperInvariant();
+                        break;
+
+                    case KEY_R_GAIN:
+                        config.RedGain = ParseDouble(value, key, configLine);
+                        break;
+
+                    case KEY_G_GAIN:
+                        config.GreenGain = ParseDouble(value, key, configLine);
+                        break;
+
+                    case KEY_B_GAIN:
+                        config.BlueGain = ParseDouble(value, key, configLine);
+                        break;
+
+                    case KEY_SMOOTHING:
+                        config.Smoothing = ParseDouble(value, key, configLine);
+                        break;
+
+                    case KEY_GPU_INDEX:
+                        config.GpuIndex = ParseInt(value, key, configLine);
+                        break;
+
+                    case KEY_ILLUM_ZONE_INDEX:
+                        config.IllumZoneIndex = ParseInt(value, key, configLine);
+                        break;
+
+                    case KEY_ILLUM_ZONE_TYPE:
+                        config.IllumZoneType = ParseInt(value, key, configLine);
+                        break;
+
+                    case KEY_FAN_CONTROL:
+                        config.FanControl = ParseBool(value, key, configLine);
+                        sawFanControl = true;
+                        break;
+
+                    case KEY_FAN_MODE:
+                        config.FanMode = ParseFanMode(value, configLine);
+                        break;
+
+                    case KEY_FAN_SPEED:
+                        config.FanSpeed = ParseInt(value, key, configLine);
+                        break;
+
+                    case KEY_FAN_COOLER_ID:
+                        config.FanCoolerId = ParseInt(value, key, configLine);
+                        break;
+
+                    case KEY_MIN_SPEED:
+                        config.MinFanSpeed = ParseInt(value, key, configLine);
+                        break;
+
+                    case KEY_FAN_RESTORE_ON_EXIT:
+                        config.FanRestoreOnExit = ParseBool(value, key, configLine);
+                        break;
+
+                    case KEY_FAN_MANUAL_OLD:
+                        oldManual = ParseBool(value, key, configLine);
+                        break;
+
+                    case KEY_FAN_CURVE_ENABLED_OLD:
+                        oldCurve = ParseBool(value, key, configLine);
+                        break;
 
                     default:
-                        if (key.StartsWith(KEY_STATUS_PREFIX) && int.TryParse(key.Substring(KEY_STATUS_PREFIX.Length), out int idx))
+                        if (key.StartsWith(KEY_STATUS_PREFIX, StringComparison.OrdinalIgnoreCase))
                         {
-                            var p = ParsePoint(val);
-                            if (p.HasValue) tempPoints[idx] = p.Value;
+                            string suffix = key.Substring(KEY_STATUS_PREFIX.Length);
+                            int pointIndex;
+
+                            if (int.TryParse(suffix, NumberStyles.Integer, CultureInfo.InvariantCulture, out pointIndex))
+                                lightingPoints[pointIndex] = ParseLightingPoint(value, configLine);
                         }
-                        else if (key.StartsWith(KEY_FAN_CURVE_PREFIX) && int.TryParse(key.Substring(KEY_FAN_CURVE_PREFIX.Length), out int fidx))
+                        else if (key.StartsWith(KEY_FAN_CURVE_PREFIX, StringComparison.OrdinalIgnoreCase))
                         {
-                            var fp = ParseFanPoint(val);
-                            if (fp.HasValue) fanPoints[fidx] = fp.Value;
+                            string suffix = key.Substring(KEY_FAN_CURVE_PREFIX.Length);
+                            int pointIndex;
+
+                            if (int.TryParse(suffix, NumberStyles.Integer, CultureInfo.InvariantCulture, out pointIndex))
+                                fanPoints[pointIndex] = ParseFanPoint(value, configLine);
                         }
+
+                        // Unknown and old RGB offset keys are intentionally ignored.
                         break;
                 }
             }
 
-            if (!lines.Any(l => l.Trim().StartsWith(KEY_FAN_CONTROL + "=", StringComparison.OrdinalIgnoreCase)))
+            if (!sawFanControl)
             {
-                if (oldManual && !oldCurve)
+                if (oldCurve)
                 {
-                    cfg.FanControl = true;
-                    cfg.FanMode = "STATIC";
+                    config.FanControl = true;
+                    config.FanMode = FanControlMode.Curve;
                 }
-                else if (oldCurve)
+                else if (oldManual)
                 {
-                    cfg.FanControl = true;
-                    cfg.FanMode = "CURVE";
+                    config.FanControl = true;
+                    config.FanMode = FanControlMode.Static;
                 }
             }
 
-            if (tempPoints.Count > 0)
-                cfg.TemperaturePoints = tempPoints.OrderBy(k => k.Key).Select(k => k.Value).ToList();
+            if (lightingPoints.Count > 0)
+                config.TemperaturePoints = lightingPoints.OrderBy(pair => pair.Key).Select(pair => pair.Value).ToList();
 
             if (fanPoints.Count > 0)
-                cfg.FanCurvePoints = fanPoints.OrderBy(k => k.Key).Select(k => k.Value).ToList();
+                config.FanCurvePoints = fanPoints.OrderBy(pair => pair.Key).Select(pair => pair.Value).ToList();
 
-            return cfg;
+            return config;
         }
 
-        private static (int Temp, string Color, int Brightness)? ParsePoint(string val)
+        public void Validate()
         {
-            var parts = val.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
-            if (parts.Length >= 2 && int.TryParse(parts[0].Trim(), out int t) && !string.IsNullOrWhiteSpace(parts[1]))
-            {
-                string c = parts[1].Trim().ToUpperInvariant();
-                if (c.Length == 6 && Regex.IsMatch(c, "^[0-9A-F]{6}$"))
-                {
-                    int b = parts.Length >= 3 && int.TryParse(parts[2].Trim(), out int br) ? br : 0;
-                    return (t, c, b);
-                }
-            }
-            return null;
+            if (GpuIndex < 0 || GpuIndex >= 64)
+                throw new InvalidDataException("GPU_INDEX MUST BE BETWEEN 0 AND 63.");
+
+            if (IllumZoneIndex < -1 || IllumZoneIndex >= 32)
+                throw new InvalidDataException("ILLUM_ZONE_INDEX MUST BE -1 OR BETWEEN 0 AND 31.");
+
+            if (IllumZoneType != 0 && IllumZoneType != 1 && IllumZoneType != 3)
+                throw new InvalidDataException("ILLUM_ZONE_TYPE MUST BE 0 (AUTO), 1 (RGB), OR 3 (RGBW).");
+
+            if (Brightness < 0 || Brightness > 100)
+                throw new InvalidDataException("BRIGHTNESS MUST BE BETWEEN 0 AND 100.");
+
+            StaticColor = NormalizeColor(StaticColor, "STATIC_COLOR");
+
+            ValidateGain(RedGain, "R_GAIN");
+            ValidateGain(GreenGain, "G_GAIN");
+            ValidateGain(BlueGain, "B_GAIN");
+
+            if (double.IsNaN(Smoothing) || double.IsInfinity(Smoothing) || Smoothing <= 0.0 || Smoothing > 1.0)
+                throw new InvalidDataException("SMOOTHING MUST BE GREATER THAN 0 AND LESS THAN OR EQUAL TO 1.");
+
+            ValidateLightingCurve();
+
+            if (FanSpeed < 0 || FanSpeed > 100)
+                throw new InvalidDataException("FAN_SPEED MUST BE BETWEEN 0 AND 100.");
+
+            if (MinFanSpeed < 0 || MinFanSpeed > 100)
+                throw new InvalidDataException("MIN_SPEED MUST BE BETWEEN 0 AND 100.");
+
+            if (FanCoolerId < 0)
+                throw new InvalidDataException("FAN_COOLER_ID MUST BE A NON-NEGATIVE INTEGER.");
+
+            ValidateFanCurve();
         }
 
-        private static (int Temp, int Speed)? ParseFanPoint(string val)
+        private void ValidateLightingCurve()
         {
-            var parts = val.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
-            if (parts.Length >= 2 && int.TryParse(parts[0].Trim(), out int t) && int.TryParse(parts[1].Trim(), out int s))
+            if (TemperaturePoints == null)
+                TemperaturePoints = new List<LightingCurvePoint>();
+
+            if (TemperaturePoints.Count > 9)
+                throw new InvalidDataException("A MAXIMUM OF 9 STATUS_P POINTS IS SUPPORTED.");
+
+            if (Mode == LightingMode.Status && TemperaturePoints.Count == 0)
+                throw new InvalidDataException("STATUS MODE REQUIRES AT LEAST ONE STATUS_P POINT.");
+
+            foreach (LightingCurvePoint point in TemperaturePoints)
             {
-                s = Math.Max(0, Math.Min(100, s));
-                return (t, s);
+                if (point == null)
+                    throw new InvalidDataException("STATUS CURVE CONTAINS A NULL POINT.");
+
+                if (point.Temperature < -100 || point.Temperature > 200)
+                    throw new InvalidDataException("STATUS TEMPERATURE MUST BE BETWEEN -100 AND 200 °C.");
+
+                point.Color = NormalizeColor(point.Color, "STATUS color");
+
+                if (point.Brightness < -1 || point.Brightness > 100)
+                    throw new InvalidDataException("STATUS BRIGHTNESS MUST BE -1 OR BETWEEN 0 AND 100.");
             }
-            return null;
+
+            TemperaturePoints = TemperaturePoints.OrderBy(point => point.Temperature).ToList();
+
+            for (int i = 1; i < TemperaturePoints.Count; i++)
+            {
+                if (TemperaturePoints[i].Temperature <= TemperaturePoints[i - 1].Temperature)
+                    throw new InvalidDataException("STATUS TEMPERATURES MUST BE UNIQUE.");
+            }
+        }
+
+        private void ValidateFanCurve()
+        {
+            if (FanCurvePoints == null)
+                FanCurvePoints = new List<FanCurvePoint>();
+
+            if (FanCurvePoints.Count > 9)
+                throw new InvalidDataException("A MAXIMUM OF 9 FAN_P POINTS IS SUPPORTED.");
+
+            if (FanControl && FanMode == FanControlMode.Curve && FanCurvePoints.Count == 0)
+                throw new InvalidDataException("CURVE FAN MODE REQUIRES AT LEAST ONE FAN_P POINT.");
+
+            foreach (FanCurvePoint point in FanCurvePoints)
+            {
+                if (point == null)
+                    throw new InvalidDataException("FAN CURVE CONTAINS A NULL POINT.");
+
+                if (point.Temperature < -100 || point.Temperature > 200)
+                    throw new InvalidDataException("FAN TEMPERATURE MUST BE BETWEEN -100 AND 200 °C.");
+
+                if (point.Speed < 0 || point.Speed > 100)
+                    throw new InvalidDataException("FAN SPEED MUST BE BETWEEN 0 AND 100.");
+            }
+
+            FanCurvePoints = FanCurvePoints.OrderBy(point => point.Temperature).ToList();
+
+            for (int i = 1; i < FanCurvePoints.Count; i++)
+            {
+                if (FanCurvePoints[i].Temperature <= FanCurvePoints[i - 1].Temperature)
+                    throw new InvalidDataException("FAN CURVE TEMPERATURES MUST BE UNIQUE.");
+            }
+        }
+
+        private static void ValidateGain(double value, string name)
+        {
+            if (double.IsNaN(value) || double.IsInfinity(value) || value < 0.0 || value > 10.0)
+                throw new InvalidDataException(name + " MUST BE BETWEEN 0.0 AND 10.0.");
         }
 
         public void Save(string path)
         {
-            var sb = new StringBuilder();
+            Validate();
 
-            // =============== NVAPI / HARDWARE SETTINGS ===============
-            sb.AppendLine("# [NVAPI / HARDWARE SETTINGS]");
-            sb.AppendLine();
+            var builder = new StringBuilder();
 
-            sb.AppendLine($"{KEY_GPU_INDEX}={GpuIndex}");
-            sb.AppendLine($"{KEY_ILLUM_ZONE_INDEX}={IllumZoneIndex}");
-            sb.AppendLine($"{KEY_ILLUM_ZONE_TYPE}={IllumZoneType}");
-            sb.AppendLine($"{KEY_RGB_R_OFFSET}={RgbROffset}");
-            sb.AppendLine($"{KEY_RGB_G_OFFSET}={RgbGOffset}");
-            sb.AppendLine($"{KEY_RGB_B_OFFSET}={RgbBOffset}");
-            sb.AppendLine($"{KEY_RGB_BRIGHTNESS_OFFSET}={RgbBrightnessOffset}");
-            sb.AppendLine($"{KEY_RGBW_R_OFFSET}={RgbwROffset}");
-            sb.AppendLine($"{KEY_RGBW_G_OFFSET}={RgbwGOffset}");
-            sb.AppendLine($"{KEY_RGBW_B_OFFSET}={RgbwBOffset}");
-            sb.AppendLine($"{KEY_RGBW_W_OFFSET}={RgbwWOffset}");
-            sb.AppendLine($"{KEY_RGBW_BRIGHTNESS_OFFSET}={RgbwBrightnessOffset}");
-            sb.AppendLine($"{KEY_CTRL_MODE}={CtrlMode}");
-            sb.AppendLine();
+            builder.AppendLine("# [NVAPI / HARDWARE SETTINGS]");
+            builder.AppendLine();
+            builder.AppendLine(KEY_GPU_INDEX + "=" + GpuIndex.ToString(CultureInfo.InvariantCulture));
+            builder.AppendLine(KEY_ILLUM_ZONE_INDEX + "=" + IllumZoneIndex.ToString(CultureInfo.InvariantCulture));
+            builder.AppendLine(KEY_ILLUM_ZONE_TYPE + "=" + IllumZoneType.ToString(CultureInfo.InvariantCulture) + " # 0=AUTO, 1=RGB, 3=RGBW");
+            builder.AppendLine();
 
-            // =============== RGB SETTINGS ===============
-            sb.AppendLine("# [RGB SETTINGS]");
-            sb.AppendLine();
+            builder.AppendLine("# [RGB SETTINGS]");
+            builder.AppendLine();
+            builder.AppendLine(KEY_MODE + "=" + LightingModeToString(Mode) + " # STATIC / STATUS");
+            builder.AppendLine(KEY_BRIGHTNESS + "=" + Brightness.ToString(CultureInfo.InvariantCulture) + " # 0-100");
+            builder.AppendLine(KEY_STATIC_COLOR + "=" + StaticColor + " # RRGGBB");
+            builder.AppendLine();
+            builder.AppendLine(KEY_R_GAIN + "=" + RedGain.ToString("0.00", CultureInfo.InvariantCulture));
+            builder.AppendLine(KEY_G_GAIN + "=" + GreenGain.ToString("0.00", CultureInfo.InvariantCulture));
+            builder.AppendLine(KEY_B_GAIN + "=" + BlueGain.ToString("0.00", CultureInfo.InvariantCulture));
+            builder.AppendLine();
+            builder.AppendLine(KEY_SMOOTHING + "=" + Smoothing.ToString("0.00", CultureInfo.InvariantCulture) + " # >0..1; LOWER = SLOWER");
+            builder.AppendLine();
+            builder.AppendLine("# TEMP,COLOR,BRIGHTNESS");
+            builder.AppendLine("# BRIGHTNESS=-1 MEANS USE GLOABAL BRIGHTNESS.");
+            builder.AppendLine("# BRIGHTNESS=0 REALLY TURNS ILLUMINATION BRIGHTNESS to 0.");
 
-            sb.AppendLine("# CALIBRATION: R,G,B");
-            sb.AppendLine($"{KEY_R_GAIN}={RedGain.ToString("F2", System.Globalization.CultureInfo.InvariantCulture)}");
-            sb.AppendLine($"{KEY_G_GAIN}={GreenGain.ToString("F2", System.Globalization.CultureInfo.InvariantCulture)}");
-            sb.AppendLine($"{KEY_B_GAIN}={BlueGain.ToString("F2", System.Globalization.CultureInfo.InvariantCulture)}");
-            sb.AppendLine();
-
-            sb.AppendLine($"{KEY_MODE}={Mode} # STATIC / STATUS");
-            sb.AppendLine($"{KEY_BRIGHTNESS}={Brightness} # BRIGHTNESS 0-100");
-            sb.AppendLine($"{KEY_SMOOTHING}={Smoothing.ToString("F2", System.Globalization.CultureInfo.InvariantCulture)} # SMOOTHING 0.01-0.50");
-            sb.AppendLine($"{KEY_STATIC_COLOR}={StaticColor} # STATIC COLOR (HEX)");
-            sb.AppendLine();
-
-            sb.AppendLine("# TEMP STATUS POINTS | MAX 9 POINTS");
-            sb.AppendLine("# TEMPERATURE,COLOR,BRIGHTNESS");
-            for (int i = 0; i < TemperaturePoints.Count && i < 9; i++)
+            for (int i = 0; i < TemperaturePoints.Count; i++)
             {
-                var pt = TemperaturePoints[i];
-                sb.AppendLine($"{KEY_STATUS_PREFIX}{i + 1}={pt.Temp},{pt.Color},{pt.Brightness}");
-            }
-            sb.AppendLine();
-
-            // =============== FAN SETTINGS ===============
-            sb.AppendLine("# [FAN SETTINGS]");
-            sb.AppendLine();
-
-            sb.AppendLine($"{KEY_FAN_CONTROL}={(FanControl ? "TRUE" : "FALSE")} # TRUE / FALSE");
-            sb.AppendLine($"{KEY_FAN_MODE}={FanMode} # CURVE / STATIC");
-            sb.AppendLine($"{KEY_FAN_SPEED}={FanSpeed} # STATIC FAN SPEED 0-100");
-            sb.AppendLine($"{KEY_FAN_COOLER_ID}={FanCoolerId} # FAN COOLER ID");
-            sb.AppendLine($"{KEY_FAN_RESTORE_ON_EXIT}={(FanRestoreOnExit ? "TRUE" : "FALSE")} # TRUE / FALSE");
-            sb.AppendLine();
-
-            sb.AppendLine("# FAN CURVE POINTS | MAX 9 POINTS");
-            sb.AppendLine("# TEMPERATURE,SPEED");
-            for (int i = 0; i < FanCurvePoints.Count && i < 9; i++)
-            {
-                var pt = FanCurvePoints[i];
-                sb.AppendLine($"{KEY_FAN_CURVE_PREFIX}{i + 1}={pt.Temp},{pt.Speed}");
+                LightingCurvePoint point = TemperaturePoints[i];
+                builder.AppendLine(
+                    KEY_STATUS_PREFIX +
+                    (i + 1).ToString(CultureInfo.InvariantCulture) + "=" +
+                    point.Temperature.ToString(CultureInfo.InvariantCulture) + "," +
+                    point.Color + "," +
+                    point.Brightness.ToString(CultureInfo.InvariantCulture));
             }
 
-            File.WriteAllText(path, sb.ToString(), Encoding.UTF8);
+            builder.AppendLine();
+            builder.AppendLine("# [FAN SETTINGS]");
+            builder.AppendLine();
+            builder.AppendLine(KEY_FAN_CONTROL + "=" + (FanControl ? "TRUE" : "FALSE"));
+            builder.AppendLine(KEY_FAN_MODE + "=" + FanModeToString(FanMode) + " # STATIC / CURVE");
+            builder.AppendLine(KEY_FAN_SPEED + "=" + FanSpeed.ToString(CultureInfo.InvariantCulture) + " # STATIC SPEED 0-100");
+            builder.AppendLine(KEY_MIN_SPEED + "=" + MinFanSpeed.ToString(CultureInfo.InvariantCulture) + " # VALUES BELOW THIS MEAN AUTO/STOP");
+            builder.AppendLine(KEY_FAN_COOLER_ID + "=" + FanCoolerId.ToString(CultureInfo.InvariantCulture));
+            builder.AppendLine(KEY_FAN_RESTORE_ON_EXIT + "=" + (FanRestoreOnExit ? "TRUE" : "FALSE"));
+            builder.AppendLine();
+            builder.AppendLine("# POINT --> TEMPERATURE,SPEED");
+
+            for (int i = 0; i < FanCurvePoints.Count; i++)
+            {
+                FanCurvePoint point = FanCurvePoints[i];
+                builder.AppendLine(
+                    KEY_FAN_CURVE_PREFIX +
+                    (i + 1).ToString(CultureInfo.InvariantCulture) + "=" +
+                    point.Temperature.ToString(CultureInfo.InvariantCulture) + "," +
+                    point.Speed.ToString(CultureInfo.InvariantCulture));
+            }
+
+            File.WriteAllText(path, builder.ToString(), new UTF8Encoding(false));
+        }
+
+        private static LightingCurvePoint ParseLightingPoint(string value, int line)
+        {
+            string[] parts = value.Split(new[] { ',' }, StringSplitOptions.None);
+
+            if (parts.Length < 2 || parts.Length > 3)
+                throw new InvalidDataException("INVALID STATUS POINT AT CONFIG LINE " + line + ".");
+
+            int temperature = ParseInt(parts[0].Trim(), "STATUS TEMPERATURE", line);
+            string color = parts[1].Trim().ToUpperInvariant();
+            int brightness = -1;
+
+            if (parts.Length >= 3 && !string.IsNullOrWhiteSpace(parts[2]))
+                brightness = ParseInt(parts[2].Trim(), "STATUS BRIGHTNESS", line);
+
+            return new LightingCurvePoint(temperature, color, brightness);
+        }
+
+        private static FanCurvePoint ParseFanPoint(string value, int line)
+        {
+            string[] parts = value.Split(new[] { ',' }, StringSplitOptions.None);
+
+            if (parts.Length != 2)
+                throw new InvalidDataException("INVALID FAN POINT AT CONFIG LINE " + line + ".");
+
+            int temperature = ParseInt(parts[0].Trim(), "FAN TEMPERATURE", line);
+            int speed = ParseInt(parts[1].Trim(), "FAN SPEED", line);
+
+            return new FanCurvePoint(temperature, speed);
+        }
+
+        private static int ParseInt(string value, string key, int line)
+        {
+            int result;
+
+            if (!int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out result))
+                throw new InvalidDataException("INVALID INTEGER FOR " + key + " AT CONFIG LINE " + line + ".");
+
+            return result;
+        }
+
+        private static double ParseDouble(string value, string key, int line)
+        {
+            double result;
+
+            if (!double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out result))
+                throw new InvalidDataException("INVALID NUMBER FOR " + key + " AT CONFIG LINE " + line + ".");
+
+            return result;
+        }
+
+        private static bool ParseBool(string value, string key, int line)
+        {
+            bool result;
+
+            if (!bool.TryParse(value, out result))
+                throw new InvalidDataException("INVALID BOOLEAN FOR " + key + " AT CONFIG LINE " + line + ". USE TRUE OR FALSE.");
+
+            return result;
+        }
+
+        private static LightingMode ParseLightingMode(string value, int line)
+        {
+            if (value.Equals("STATIC", StringComparison.OrdinalIgnoreCase))
+                return LightingMode.Static;
+
+            if (value.Equals("STATUS", StringComparison.OrdinalIgnoreCase))
+                return LightingMode.Status;
+
+            throw new InvalidDataException("INVALID MODE AT CONFIG LINE " + line + ". USE STATIC OR STATUS.");
+        }
+
+        private static FanControlMode ParseFanMode(string value, int line)
+        {
+            if (value.Equals("STATIC", StringComparison.OrdinalIgnoreCase))
+                return FanControlMode.Static;
+
+            if (value.Equals("CURVE", StringComparison.OrdinalIgnoreCase))
+                return FanControlMode.Curve;
+
+            throw new InvalidDataException("INVALID FAN_MODE AT CONFIG LINE " + line + ". USE STATIC OR CURVE.");
+        }
+
+        private static string LightingModeToString(LightingMode mode)
+        {
+            return mode == LightingMode.Static ? "STATIC" : "STATUS";
+        }
+
+        private static string FanModeToString(FanControlMode mode)
+        {
+            return mode == FanControlMode.Static ? "STATIC" : "CURVE";
+        }
+
+        private static string RemoveInlineComment(string value)
+        {
+            int commentIndex = value.IndexOfAny(new[] { '#', ';' });
+
+            if (commentIndex >= 0)
+                value = value.Substring(0, commentIndex).Trim();
+
+            return value;
+        }
+
+        private static string NormalizeColor(string color, string name)
+        {
+            if (string.IsNullOrWhiteSpace(color))
+                throw new InvalidDataException(name + " CANNOT BE EMPTY.");
+
+            color = color.Trim().ToUpperInvariant();
+
+            if (!Regex.IsMatch(color, "^[0-9A-F]{6}$"))
+                throw new InvalidDataException(name + " MUST CONTAIN EXACTLY SIX HEXADECIMAL CHARACTERS.");
+
+            return color;
         }
     }
 }
